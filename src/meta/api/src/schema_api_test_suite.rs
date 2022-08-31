@@ -15,7 +15,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use anyerror::AnyError;
 use common_datavalues::chrono::DateTime;
 use common_datavalues::chrono::Duration;
 use common_datavalues::chrono::Utc;
@@ -54,22 +53,31 @@ use common_meta_app::schema::UndropDatabaseReq;
 use common_meta_app::schema::UndropTableReq;
 use common_meta_app::schema::UpdateTableMetaReq;
 use common_meta_app::schema::UpsertTableOptionReq;
+use common_meta_app::share::AddShareAccountsReq;
+use common_meta_app::share::CreateShareReq;
+use common_meta_app::share::GrantShareObjectReq;
+use common_meta_app::share::ShareGrantObjectName;
+use common_meta_app::share::ShareGrantObjectPrivilege;
+use common_meta_app::share::ShareId;
+use common_meta_app::share::ShareMeta;
+use common_meta_app::share::ShareNameIdent;
 use common_meta_types::GCDroppedDataReq;
 use common_meta_types::MatchSeq;
 use common_meta_types::MetaError;
 use common_meta_types::Operation;
 use common_meta_types::UpsertKVReq;
-use common_proto_conv::FromToProto;
 use tracing::debug;
 use tracing::info;
 
-use crate::deserialize_struct;
+use crate::get_kv_data;
+use crate::is_all_db_data_removed;
 use crate::serialize_struct;
 use crate::ApiBuilder;
 use crate::AsKVApi;
 use crate::KVApi;
 use crate::KVApiKey;
 use crate::SchemaApi;
+use crate::ShareApi;
 
 /// Test suite of `SchemaApi`.
 ///
@@ -193,33 +201,20 @@ async fn delete_test_data(
     Ok(())
 }
 
-async fn get_test_data<T>(
-    kv_api: &(impl KVApi + ?Sized),
-    key: &impl KVApiKey,
-) -> Result<T, MetaError>
-where
-    T: FromToProto,
-    T::PB: common_protos::prost::Message + Default,
-{
-    let res = kv_api.get_kv(&key.to_key()).await?;
-    if let Some(res) = res {
-        return deserialize_struct(&res.data);
-    };
-
-    Err(MetaError::SerdeError(AnyError::error("get_kv fail")))
-}
-
 impl SchemaApiTestSuite {
     /// Test SchemaAPI on a single node
     pub async fn test_single_node<B, MT>(b: B) -> anyhow::Result<()>
     where
         B: ApiBuilder<MT>,
-        MT: SchemaApi + AsKVApi,
+        MT: ShareApi + AsKVApi + SchemaApi,
     {
         let suite = SchemaApiTestSuite {};
 
         suite.database_and_table_rename(&b.build().await).await?;
         suite.database_create_get_drop(&b.build().await).await?;
+        suite
+            .database_create_from_share_and_drop(&b.build().await)
+            .await?;
         suite
             .database_create_get_drop_in_diff_tenant(&b.build().await)
             .await?;
@@ -385,12 +380,12 @@ impl SchemaApiTestSuite {
 
             let db_id_name_key = DatabaseIdToName { db_id };
             let ret_db_name_ident: DatabaseNameIdent =
-                get_test_data(mt.as_kv_api(), &db_id_name_key).await?;
+                get_kv_data(mt.as_kv_api(), &db_id_name_key).await?;
             assert_eq!(ret_db_name_ident, db_name_ident);
 
             let table_id_name_key = TableIdToName { table_id };
             let ret_table_name_ident: DBIdTableName =
-                get_test_data(mt.as_kv_api(), &table_id_name_key).await?;
+                get_kv_data(mt.as_kv_api(), &table_id_name_key).await?;
             assert_eq!(ret_table_name_ident, DBIdTableName {
                 db_id,
                 table_name: table_name.to_string()
@@ -410,12 +405,12 @@ impl SchemaApiTestSuite {
 
             let db_id_2_name_key = DatabaseIdToName { db_id };
             let ret_db_name_ident: DatabaseNameIdent =
-                get_test_data(mt.as_kv_api(), &db_id_2_name_key).await?;
+                get_kv_data(mt.as_kv_api(), &db_id_2_name_key).await?;
             assert_eq!(ret_db_name_ident, db2_name_ident);
 
             let table_id_name_key = TableIdToName { table_id };
             let ret_table_name_ident: DBIdTableName =
-                get_test_data(mt.as_kv_api(), &table_id_name_key).await?;
+                get_kv_data(mt.as_kv_api(), &table_id_name_key).await?;
             assert_eq!(ret_table_name_ident, DBIdTableName {
                 db_id,
                 table_name: table_name.to_string()
@@ -440,7 +435,7 @@ impl SchemaApiTestSuite {
 
             let table_id_name_key = TableIdToName { table_id };
             let ret_table_name_ident: DBIdTableName =
-                get_test_data(mt.as_kv_api(), &table_id_name_key).await?;
+                get_kv_data(mt.as_kv_api(), &table_id_name_key).await?;
             assert_eq!(ret_table_name_ident, DBIdTableName {
                 db_id,
                 table_name: table2_name.to_string()
@@ -465,7 +460,7 @@ impl SchemaApiTestSuite {
 
             let table_id_name_key = TableIdToName { table_id };
             let ret_table_name_ident: DBIdTableName =
-                get_test_data(mt.as_kv_api(), &table_id_name_key).await?;
+                get_kv_data(mt.as_kv_api(), &table_id_name_key).await?;
             assert_eq!(ret_table_name_ident, DBIdTableName {
                 db_id: db3_id,
                 table_name: table3_name.to_string()
@@ -623,6 +618,193 @@ impl SchemaApiTestSuite {
                 },
             })
             .await?;
+        }
+
+        Ok(())
+    }
+
+    #[tracing::instrument(level = "debug", skip_all)]
+    async fn database_create_from_share_and_drop<MT: ShareApi + AsKVApi + SchemaApi>(
+        &self,
+        mt: &MT,
+    ) -> anyhow::Result<()> {
+        let tenant1 = "tenant1";
+        let tenant2 = "tenant2";
+        let db1 = "db1";
+        let db2 = "db2";
+        let share = "share";
+        let share_name = ShareNameIdent {
+            tenant: tenant2.to_string(),
+            share_name: share.to_string(),
+        };
+        let db_name1 = DatabaseNameIdent {
+            tenant: tenant1.to_string(),
+            db_name: db1.to_string(),
+        };
+        let db_name2 = DatabaseNameIdent {
+            tenant: tenant2.to_string(),
+            db_name: db2.to_string(),
+        };
+        let db_id;
+        let share_id;
+
+        info!("--- tenant1 create db1 from an unknown share");
+        {
+            let req = CreateDatabaseReq {
+                if_not_exists: false,
+                name_ident: db_name1.clone(),
+                meta: DatabaseMeta {
+                    from_share: Some(share_name.clone()),
+                    ..Default::default()
+                },
+            };
+
+            let res = mt.create_database(req).await;
+            info!("create database res: {:?}", res);
+            let err = res.unwrap_err();
+            assert_eq!(
+                ErrorCode::UnknownShare("").code(),
+                ErrorCode::from(err).code()
+            );
+        };
+
+        info!("--- create a share and tenant1 create db1 from a share");
+        {
+            // first create the share but not grant the tenant
+            let create_on = Utc::now();
+            let share_on = Utc::now();
+            let req = CreateShareReq {
+                if_not_exists: false,
+                share_name: share_name.clone(),
+                comment: None,
+                create_on,
+            };
+
+            let res = mt.create_share(req).await;
+            info!("create share res: {:?}", res);
+            assert!(res.is_ok());
+            // save the share id
+            share_id = res.unwrap().share_id;
+
+            let req = CreateDatabaseReq {
+                if_not_exists: false,
+                name_ident: db_name1.clone(),
+                meta: DatabaseMeta {
+                    from_share: Some(share_name.clone()),
+                    ..Default::default()
+                },
+            };
+
+            let res = mt.create_database(req).await;
+            info!("create database res: {:?}", res);
+            let err = res.unwrap_err();
+            assert_eq!(
+                ErrorCode::UnknownShareAccounts("").code(),
+                ErrorCode::from(err).code()
+            );
+
+            // grant the tenant to access the share
+            let req = AddShareAccountsReq {
+                share_name: share_name.clone(),
+                share_on,
+                if_exists: false,
+                accounts: vec![tenant1.to_string()],
+            };
+
+            let res = mt.add_share_tenants(req).await;
+            assert!(res.is_ok());
+
+            // try again create database from the share
+            let req = CreateDatabaseReq {
+                if_not_exists: false,
+                name_ident: db_name1.clone(),
+                meta: DatabaseMeta {
+                    from_share: Some(share_name.clone()),
+                    ..Default::default()
+                },
+            };
+
+            let res = mt.create_database(req).await;
+            info!("create database res: {:?}", res);
+            let err = res.unwrap_err();
+            assert_eq!(
+                ErrorCode::ShareHasNoGrantedDatabase("").code(),
+                ErrorCode::from(err).code()
+            );
+
+            // create database of tenant2
+            let req = CreateDatabaseReq {
+                if_not_exists: false,
+                name_ident: db_name2.clone(),
+                meta: DatabaseMeta {
+                    ..Default::default()
+                },
+            };
+
+            let res = mt.create_database(req).await;
+            info!("create database res: {:?}", res);
+            assert!(res.is_ok());
+
+            // and grant access to database from the share
+            let req = GrantShareObjectReq {
+                share_name: share_name.clone(),
+                object: ShareGrantObjectName::Database(db2.to_string()),
+                grant_on: create_on,
+                privilege: ShareGrantObjectPrivilege::Usage,
+            };
+
+            let _ = mt.grant_share_object(req).await?;
+
+            // after grant access to database, create database from share MUST succeeds
+            let req = CreateDatabaseReq {
+                if_not_exists: false,
+                name_ident: db_name1.clone(),
+                meta: DatabaseMeta {
+                    from_share: Some(share_name.clone()),
+                    ..Default::default()
+                },
+            };
+
+            let res = mt.create_database(req).await;
+            info!("create database res: {:?}", res);
+            assert!(res.is_ok());
+            // save the db id
+            db_id = res.unwrap().db_id;
+        };
+
+        // drop database created from share
+        {
+            // check that share db id contains the db id
+            let share_id_key = ShareId { share_id };
+            let share_meta: ShareMeta = get_kv_data(mt.as_kv_api(), &share_id_key).await?;
+            assert!(share_meta.has_share_from_db_id(db_id));
+
+            mt.drop_database(DropDatabaseReq {
+                if_exists: false,
+                name_ident: db_name1.clone(),
+            })
+            .await?;
+
+            // check that share db id has removed the db id
+            let share_id_key = ShareId { share_id };
+            let share_meta: ShareMeta = get_kv_data(mt.as_kv_api(), &share_id_key).await?;
+            assert!(!share_meta.has_share_from_db_id(db_id));
+
+            // check that DatabaseMeta has been removed
+            let res = is_all_db_data_removed(mt.as_kv_api(), db_id).await?;
+            assert!(res);
+
+            // db has been removed, so undrop_database MUST return error
+            let res = mt
+                .undrop_database(UndropDatabaseReq {
+                    name_ident: db_name1.clone(),
+                })
+                .await;
+            assert!(res.is_err());
+            assert_eq!(
+                ErrorCode::UndropDbHasNoHistory("").code(),
+                ErrorCode::from(res.unwrap_err()).code()
+            );
         }
 
         Ok(())
@@ -2169,11 +2351,11 @@ impl SchemaApiTestSuite {
         self.create_out_of_retention_time_db(mt, db_name_ident2.clone(), drop_on, false)
             .await?;
 
-        let id_list: DbIdList = get_test_data(mt.as_kv_api(), &dbid_idlist1).await?;
+        let id_list: DbIdList = get_kv_data(mt.as_kv_api(), &dbid_idlist1).await?;
         assert_eq!(id_list.len(), 2);
         let old_id_list = id_list.id_list().clone();
 
-        let id_list: DbIdList = get_test_data(mt.as_kv_api(), &dbid_idlist2).await?;
+        let id_list: DbIdList = get_kv_data(mt.as_kv_api(), &dbid_idlist2).await?;
         assert_eq!(id_list.len(), 1);
 
         let req = GCDroppedDataReq {
@@ -2185,7 +2367,7 @@ impl SchemaApiTestSuite {
         assert_eq!(res.gc_db_count, 2);
 
         // assert db id list has been cleaned
-        let id_list: DbIdList = get_test_data(mt.as_kv_api(), &dbid_idlist1).await?;
+        let id_list: DbIdList = get_kv_data(mt.as_kv_api(), &dbid_idlist1).await?;
         assert_eq!(id_list.len(), 0);
 
         // assert old db meta and id to name mapping has been removed
@@ -2193,14 +2375,14 @@ impl SchemaApiTestSuite {
             let id_key = DatabaseId { db_id: *db_id };
             let id_mapping = DatabaseIdToName { db_id: *db_id };
             let meta_res: Result<DatabaseMeta, MetaError> =
-                get_test_data(mt.as_kv_api(), &id_key).await;
+                get_kv_data(mt.as_kv_api(), &id_key).await;
             let mapping_res: Result<DatabaseNameIdent, MetaError> =
-                get_test_data(mt.as_kv_api(), &id_mapping).await;
+                get_kv_data(mt.as_kv_api(), &id_mapping).await;
             assert!(meta_res.is_err());
             assert!(mapping_res.is_err());
         }
 
-        let id_list: DbIdList = get_test_data(mt.as_kv_api(), &dbid_idlist2).await?;
+        let id_list: DbIdList = get_kv_data(mt.as_kv_api(), &dbid_idlist2).await?;
         assert_eq!(id_list.len(), 1);
 
         Ok(())
@@ -2318,7 +2500,7 @@ impl SchemaApiTestSuite {
         };
 
         // save old id list
-        let id_list: TableIdList = get_test_data(mt.as_kv_api(), &table_id_idlist).await?;
+        let id_list: TableIdList = get_kv_data(mt.as_kv_api(), &table_id_idlist).await?;
         assert_eq!(id_list.len(), 2);
         let old_id_list = id_list.id_list().clone();
 
@@ -2330,7 +2512,7 @@ impl SchemaApiTestSuite {
         let res = mt.gc_dropped_data(req).await?;
         assert_eq!(res.gc_table_count, 2);
 
-        let id_list: TableIdList = get_test_data(mt.as_kv_api(), &table_id_idlist).await?;
+        let id_list: TableIdList = get_kv_data(mt.as_kv_api(), &table_id_idlist).await?;
         assert_eq!(id_list.len(), 0);
 
         // assert old table meta and id to name mapping has been removed
@@ -2342,9 +2524,9 @@ impl SchemaApiTestSuite {
                 table_id: *table_id,
             };
             let meta_res: Result<DatabaseMeta, MetaError> =
-                get_test_data(mt.as_kv_api(), &id_key).await;
+                get_kv_data(mt.as_kv_api(), &id_key).await;
             let mapping_res: Result<DBIdTableName, MetaError> =
-                get_test_data(mt.as_kv_api(), &id_mapping).await;
+                get_kv_data(mt.as_kv_api(), &id_mapping).await;
             assert!(meta_res.is_err());
             assert!(mapping_res.is_err());
         }

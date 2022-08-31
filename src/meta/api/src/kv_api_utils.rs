@@ -15,10 +15,18 @@
 use std::fmt::Display;
 
 use anyerror::AnyError;
+use common_meta_app::schema::DatabaseId;
+use common_meta_app::schema::DatabaseIdToName;
+use common_meta_app::schema::DatabaseMeta;
 use common_meta_app::schema::DatabaseNameIdent;
 use common_meta_app::schema::TableNameIdent;
+use common_meta_app::share::*;
 use common_meta_types::app_error::AppError;
+use common_meta_types::app_error::ShareHasNoGrantedDatabase;
 use common_meta_types::app_error::UnknownDatabase;
+use common_meta_types::app_error::UnknownShare;
+use common_meta_types::app_error::UnknownShareAccounts;
+use common_meta_types::app_error::UnknownShareId;
 use common_meta_types::app_error::UnknownTable;
 use common_meta_types::txn_condition::Target;
 use common_meta_types::txn_op::Request;
@@ -34,7 +42,9 @@ use common_meta_types::TxnPutRequest;
 use common_meta_types::TxnRequest;
 use common_meta_types::UpsertKVReq;
 use common_proto_conv::FromToProto;
+use enumflags2::BitFlags;
 use tracing::debug;
+use ConditionResult::Eq;
 
 use crate::Id;
 use crate::KVApi;
@@ -190,7 +200,7 @@ pub fn meta_encode_err<E: std::error::Error + 'static>(e: E) -> MetaError {
 }
 
 pub async fn send_txn(
-    kv_api: &impl KVApi,
+    kv_api: &(impl KVApi + ?Sized),
     txn_req: TxnRequest,
 ) -> Result<(bool, Vec<TxnOpResponse>), MetaError> {
     let tx_reply = kv_api.transaction(txn_req).await?;
@@ -267,5 +277,242 @@ pub fn table_has_to_exist(
         )))
     } else {
         Ok(())
+    }
+}
+
+// Return (share_id_seq, share_id, share_meta_seq, share_meta)
+pub async fn get_share_or_err(
+    kv_api: &(impl KVApi + ?Sized),
+    name_key: &ShareNameIdent,
+    msg: impl Display,
+) -> Result<(u64, u64, u64, ShareMeta), MetaError> {
+    let (share_id_seq, share_id) = get_u64_value(kv_api, name_key).await?;
+    share_has_to_exist(share_id_seq, name_key, &msg)?;
+
+    let (share_meta_seq, share_meta) = get_share_meta_by_id_or_err(kv_api, share_id, msg).await?;
+
+    Ok((share_id_seq, share_id, share_meta_seq, share_meta))
+}
+
+/// Returns (share_meta_seq, share_meta)
+pub async fn get_share_meta_by_id_or_err(
+    kv_api: &(impl KVApi + ?Sized),
+    share_id: u64,
+    msg: impl Display,
+) -> Result<(u64, ShareMeta), MetaError> {
+    let id_key = ShareId { share_id };
+
+    let (share_meta_seq, share_meta) = get_struct_value(kv_api, &id_key).await?;
+    share_meta_has_to_exist(share_meta_seq, share_id, msg)?;
+
+    Ok((share_meta_seq, share_meta.unwrap()))
+}
+
+fn share_meta_has_to_exist(seq: u64, share_id: u64, msg: impl Display) -> Result<(), MetaError> {
+    if seq == 0 {
+        debug!(seq, ?share_id, "share meta does not exist");
+
+        Err(MetaError::AppError(AppError::UnknownShareId(
+            UnknownShareId::new(share_id, format!("{}: {}", msg, share_id)),
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+/// Return OK if a share_id or share_meta exists by checking the seq.
+///
+/// Otherwise returns UnknownShare error
+fn share_has_to_exist(
+    seq: u64,
+    share_name_ident: &ShareNameIdent,
+    msg: impl Display,
+) -> Result<(), MetaError> {
+    if seq == 0 {
+        debug!(seq, ?share_name_ident, "share does not exist");
+
+        Err(MetaError::AppError(AppError::UnknownShare(
+            UnknownShare::new(
+                &share_name_ident.share_name,
+                format!("{}: {}", msg, share_name_ident),
+            ),
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+/// Returns (share_account_meta_seq, share_account_meta)
+pub async fn get_share_account_meta_or_err(
+    kv_api: &(impl KVApi + ?Sized),
+    name_key: &ShareAccountNameIdent,
+    msg: impl Display,
+) -> Result<(u64, ShareAccountMeta), MetaError> {
+    let (share_account_meta_seq, share_account_meta): (u64, Option<ShareAccountMeta>) =
+        get_struct_value(kv_api, name_key).await?;
+    share_account_meta_has_to_exist(share_account_meta_seq, name_key, msg)?;
+
+    Ok((
+        share_account_meta_seq,
+        // Safe unwrap(): share_meta_seq > 0 implies share_meta is not None.
+        share_account_meta.unwrap(),
+    ))
+}
+
+/// Return OK if a share_id or share_account_meta exists by checking the seq.
+///
+/// Otherwise returns UnknownShareAccounts error
+fn share_account_meta_has_to_exist(
+    seq: u64,
+    name_key: &ShareAccountNameIdent,
+    msg: impl Display,
+) -> Result<(), MetaError> {
+    if seq == 0 {
+        debug!(seq, ?name_key, "share account does not exist");
+
+        Err(MetaError::AppError(AppError::UnknownShareAccounts(
+            UnknownShareAccounts::new(
+                &[name_key.account.clone()],
+                name_key.share_id,
+                format!("{}: {}", msg, name_key),
+            ),
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+/// Returns (share_meta_seq, share_meta)
+pub async fn get_share_id_to_name_or_err(
+    kv_api: &(impl KVApi + ?Sized),
+    share_id: u64,
+    msg: impl Display,
+) -> Result<(u64, ShareNameIdent), MetaError> {
+    let id_key = ShareIdToName { share_id };
+
+    let (share_name_seq, share_name) = get_struct_value(kv_api, &id_key).await?;
+    if share_name_seq == 0 {
+        debug!(share_name_seq, ?share_id, "share meta does not exist");
+
+        return Err(MetaError::AppError(AppError::UnknownShareId(
+            UnknownShareId::new(share_id, format!("{}: {}", msg, share_id)),
+        )));
+    }
+
+    Ok((share_name_seq, share_name.unwrap()))
+}
+
+pub fn get_share_database_id_and_privilege(
+    name_key: &ShareNameIdent,
+    share_meta: &ShareMeta,
+) -> Result<(u64, BitFlags<ShareGrantObjectPrivilege>), MetaError> {
+    if let Some(entry) = &share_meta.database {
+        if let ShareGrantObject::Database(db_id) = entry.object {
+            return Ok((db_id, entry.privileges));
+        } else {
+            unreachable!("database MUST be Database object");
+        }
+    }
+
+    Err(MetaError::AppError(AppError::ShareHasNoGrantedDatabase(
+        ShareHasNoGrantedDatabase::new(&name_key.tenant, &name_key.share_name),
+    )))
+}
+
+// Return true if all the database data has been removed.
+pub async fn is_all_db_data_removed(
+    kv_api: &(impl KVApi + ?Sized),
+    db_id: u64,
+) -> Result<bool, MetaError> {
+    let dbid = DatabaseId { db_id };
+
+    let (db_meta_seq, db_meta): (_, Option<DatabaseMeta>) = get_struct_value(kv_api, &dbid).await?;
+    debug_assert_eq!((db_meta_seq == 0), db_meta.is_none());
+    if db_meta_seq != 0 {
+        return Ok(false);
+    }
+
+    let id_to_name = DatabaseIdToName { db_id };
+    let (name_ident_seq, name_ident): (_, Option<DatabaseNameIdent>) =
+        get_struct_value(kv_api, &id_to_name).await?;
+    debug_assert_eq!((name_ident_seq == 0), name_ident.is_none());
+    if name_ident_seq != 0 {
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+// Return (true, `DataBaseMeta.from_share`) if the database needs to be removed, otherwise return (false, None).
+// f: the predict function whether or not the database needs to be removed
+//    base on the database meta passed by the user.
+// When the database needs to be removed, add `TxnCondition` into `condition`
+//    and `TxnOp` into the `if_then`.
+pub async fn is_db_need_to_be_remove<F>(
+    kv_api: &(impl KVApi + ?Sized),
+    db_id: u64,
+    mut f: F,
+    condition: &mut Vec<TxnCondition>,
+    if_then: &mut Vec<TxnOp>,
+) -> Result<(bool, Option<ShareNameIdent>), MetaError>
+where
+    F: FnMut(&DatabaseMeta) -> bool,
+{
+    let dbid = DatabaseId { db_id };
+
+    let (db_meta_seq, db_meta): (_, Option<DatabaseMeta>) = get_struct_value(kv_api, &dbid).await?;
+    if db_meta_seq == 0 {
+        return Ok((false, None));
+    }
+
+    let id_to_name = DatabaseIdToName { db_id };
+    let (name_ident_seq, _name_ident): (_, Option<DatabaseNameIdent>) =
+        get_struct_value(kv_api, &id_to_name).await?;
+    if name_ident_seq == 0 {
+        return Ok((false, None));
+    }
+
+    if let Some(db_meta) = db_meta {
+        if f(&db_meta) {
+            condition.push(txn_cond_seq(&dbid, Eq, db_meta_seq));
+            if_then.push(txn_op_del(&dbid));
+            condition.push(txn_cond_seq(&id_to_name, Eq, name_ident_seq));
+            if_then.push(txn_op_del(&id_to_name));
+
+            return Ok((true, db_meta.from_share.clone()));
+        }
+    }
+    Ok((false, None))
+}
+
+pub async fn get_kv_data<T>(
+    kv_api: &(impl KVApi + ?Sized),
+    key: &impl KVApiKey,
+) -> Result<T, MetaError>
+where
+    T: FromToProto,
+    T::PB: common_protos::prost::Message + Default,
+{
+    let res = kv_api.get_kv(&key.to_key()).await?;
+    if let Some(res) = res {
+        return deserialize_struct(&res.data);
+    };
+
+    Err(MetaError::SerdeError(AnyError::error(format!(
+        "get_kv {:?} fail",
+        key.to_key()
+    ))))
+}
+
+pub async fn get_object_shared_by_share_ids(
+    kv_api: &(impl KVApi + ?Sized),
+    object: &ShareGrantObject,
+) -> Result<(u64, ObjectSharedByShareIds), MetaError> {
+    let (seq, share_ids): (u64, Option<ObjectSharedByShareIds>) =
+        get_struct_value(kv_api, object).await?;
+
+    match share_ids {
+        Some(share_ids) => Ok((seq, share_ids)),
+        None => Ok((0, ObjectSharedByShareIds::default())),
     }
 }

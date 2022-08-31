@@ -25,6 +25,7 @@ use super::fragments::Fragmenter;
 use super::QueryFragmentsActions;
 use crate::interpreters::Interpreter;
 use crate::sessions::QueryContext;
+use crate::sql::executor::PhysicalPlan;
 use crate::sql::executor::PhysicalPlanBuilder;
 use crate::sql::executor::PipelineBuilder;
 use crate::sql::optimizer::SExpr;
@@ -50,13 +51,25 @@ impl Interpreter for ExplainInterpreterV2 {
 
     async fn execute(&self) -> Result<SendableDataBlockStream> {
         let blocks = match &self.kind {
-            ExplainKind::Syntax(pretty_stmt) => self.explain_syntax(pretty_stmt.clone())?,
-            ExplainKind::Raw | ExplainKind::Plan => self.explain_raw_or_plan(&self.plan)?,
+            ExplainKind::Ast(stmt) | ExplainKind::Syntax(stmt) => {
+                self.explain_ast_or_syntax(stmt.clone())?
+            }
+            ExplainKind::Raw => self.explain_plan(&self.plan)?,
+            ExplainKind::Plan => match &self.plan {
+                Plan::Query {
+                    s_expr, metadata, ..
+                } => {
+                    let builder = PhysicalPlanBuilder::new(metadata.clone(), self.ctx.clone());
+                    let plan = builder.build(s_expr).await?;
+                    self.explain_physical_plan(&plan, metadata)?
+                }
+                _ => self.explain_plan(&self.plan)?,
+            },
             ExplainKind::Pipeline => match &self.plan {
                 Plan::Query {
                     s_expr, metadata, ..
                 } => {
-                    self.explain_pipeline(s_expr.clone(), metadata.clone())
+                    self.explain_pipeline(*s_expr.clone(), metadata.clone())
                         .await?
                 }
                 _ => {
@@ -67,7 +80,7 @@ impl Interpreter for ExplainInterpreterV2 {
                 Plan::Query {
                     s_expr, metadata, ..
                 } => {
-                    self.explain_fragments(s_expr.clone(), metadata.clone())
+                    self.explain_fragments(*s_expr.clone(), metadata.clone())
                         .await?
                 }
                 _ => {
@@ -106,16 +119,29 @@ impl ExplainInterpreterV2 {
         })
     }
 
-    pub fn explain_syntax(&self, pretty_stmt: String) -> Result<Vec<DataBlock>> {
-        let line_splitted_result: Vec<&str> = pretty_stmt.lines().collect();
+    pub fn explain_ast_or_syntax(&self, stmt: String) -> Result<Vec<DataBlock>> {
+        let line_splitted_result: Vec<&str> = stmt.lines().collect();
         let formatted_sql = Series::from_data(line_splitted_result);
         Ok(vec![DataBlock::create(self.schema.clone(), vec![
             formatted_sql,
         ])])
     }
 
-    pub fn explain_raw_or_plan(&self, plan: &Plan) -> Result<Vec<DataBlock>> {
+    pub fn explain_plan(&self, plan: &Plan) -> Result<Vec<DataBlock>> {
         let result = plan.format_indent()?;
+        let line_splitted_result: Vec<&str> = result.lines().collect();
+        let formatted_plan = Series::from_data(line_splitted_result);
+        Ok(vec![DataBlock::create(self.schema.clone(), vec![
+            formatted_plan,
+        ])])
+    }
+
+    pub fn explain_physical_plan(
+        &self,
+        plan: &PhysicalPlan,
+        metadata: &MetadataRef,
+    ) -> Result<Vec<DataBlock>> {
+        let result = plan.format(metadata.clone())?;
         let line_splitted_result: Vec<&str> = result.lines().collect();
         let formatted_plan = Series::from_data(line_splitted_result);
         Ok(vec![DataBlock::create(self.schema.clone(), vec![

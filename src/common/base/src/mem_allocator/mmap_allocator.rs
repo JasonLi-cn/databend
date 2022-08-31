@@ -169,7 +169,7 @@ unsafe fn mremapx(
             new_address as *mut u8,
             old_size as usize,
         );
-        return new_address;
+        new_address
     }
     #[cfg(target_os = "linux")]
     mremap(
@@ -213,7 +213,10 @@ mod tests {
     type Aloc = MmapAllocator<true>;
 
     fn clear_errno() {
-        unsafe { *libc::__errno_location() = 0 }
+        #[cfg(target_os = "linux")]
+        unsafe {
+            *libc::__errno_location() = 0
+        }
     }
 
     #[test]

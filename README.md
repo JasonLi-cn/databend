@@ -5,7 +5,7 @@
   <a href="https://databend.rs/doc/cloud">Databend Serverless Cloud (beta)</a>  |
   <a href="https://databend.rs/doc">Documentation</a>  |
   <a href="https://perf.databend.rs">Benchmarking</a>  |
-  <a href="https://github.com/datafuselabs/databend/issues/4591">Roadmap (v0.8)</a>
+  <a href="https://github.com/datafuselabs/databend/issues/7052">Roadmap (v0.9)</a>
 
 </h4>
 
@@ -40,7 +40,7 @@
 
 Databend is an open-source **Elastic** and **Workload-Aware** modern cloud data warehouse.
 
-Databend uses the latest techniques in vectorized query processing to allow you to do blazing-fast data analytics on object storage([S3](https://aws.amazon.com/s3/), [Azure Blob](https://azure.microsoft.com/en-us/services/storage/blobs/) or [MinIO](https://min.io)).
+Databend uses the latest techniques in vectorized query processing to allow you to do blazing-fast data analytics on object storage([S3](https://aws.amazon.com/s3/), [Azure Blob](https://azure.microsoft.com/en-us/services/storage/blobs/), [Google Cloud Storage](https://cloud.google.com/storage/) or [MinIO](https://min.io)).
 
 - __Instant Elasticity__
 
@@ -159,7 +159,6 @@ docker run --net=host  datafuselabs/databend
 
 ### Use Cases
 
-- [Analyzing Github Repository With Databend](https://databend.rs/doc/learn/analyze-github-repo-with-databend)
 - [Analyzing Nginx Access Logs With Databend](https://databend.rs/doc/learn/analyze-nginx-logs-with-databend-and-vector)
 - [User Retention Analysis With Databend](https://databend.rs/doc/learn/analyze-user-retention-with-databend)
 - [Conversion Funnel Analysis With Databend](https://databend.rs/doc/learn/analyze-funnel-with-databend)
@@ -185,12 +184,13 @@ To get started with contributing:
 For general help in using Databend, please refer to the official documentation. For additional help, you can use one of these channels to ask a question:
 
 - [Slack](https://link.databend.rs/join-slack) (For live discussion with the Community)
-- [Github](https://github.com/datafuselabs/databend) (Feature/Bug reports, Contributions)
+- [GitHub](https://github.com/datafuselabs/databend) (Feature/Bug reports, Contributions)
 - [Twitter](https://twitter.com/Datafuse_Labs) (Get the news fast)
 - [Weekly](https://weekly.databend.rs/) (A weekly newsletter about Databend)
 - [I'm feeling lucky](https://link.databend.rs/i-m-feeling-lucky) (Pick up a good first issue now!)
 
 ## Roadmap
+- [Roadmap v0.9](https://github.com/datafuselabs/databend/issues/7052)
 - [Roadmap v0.8](https://github.com/datafuselabs/databend/issues/4591)
 - [Roadmap 2022](https://github.com/datafuselabs/databend/issues/3706)
 

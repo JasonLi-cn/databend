@@ -455,6 +455,10 @@ impl SubqueryRewriter {
                     table_index,
                     columns: self.derived_columns.values().cloned().collect(),
                     push_down_predicates: None,
+                    limit: None,
+                    order_by: None,
+                    statistics: None,
+                    prewhere: None,
                 }
                 .into(),
             );

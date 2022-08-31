@@ -85,6 +85,12 @@ pub trait Table: Sync + Send {
         vec![]
     }
 
+    /// Whether the table engine supports prewhere optimization.
+    /// only Fuse Engine supports this.
+    fn support_prewhere(&self) -> bool {
+        false
+    }
+
     async fn alter_table_cluster_keys(
         &self,
         _ctx: Arc<dyn TableContext>,
@@ -224,7 +230,7 @@ pub enum NavigationPoint {
     TimePoint(DateTime<Utc>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub struct TableStatistics {
     pub num_rows: Option<u64>,
     pub data_size: Option<u64>,

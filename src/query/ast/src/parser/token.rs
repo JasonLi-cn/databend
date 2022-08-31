@@ -253,6 +253,8 @@ pub enum TokenKind {
     ARRAY,
     #[token("AS", ignore(ascii_case))]
     AS,
+    #[token("AST", ignore(ascii_case))]
+    AST,
     #[token("AT", ignore(ascii_case))]
     AT,
     #[token("ASC", ignore(ascii_case))]
@@ -411,8 +413,6 @@ pub enum TokenKind {
     FUNCTIONS,
     #[token("FUSE", ignore(ascii_case))]
     FUSE,
-    #[token("GITHUB", ignore(ascii_case))]
-    GITHUB,
     #[token("GLOBAL", ignore(ascii_case))]
     GLOBAL,
     #[token("GRAPH", ignore(ascii_case))]
@@ -810,7 +810,7 @@ impl TokenKind {
             | TokenKind::CASE
             | TokenKind::CAST
             // | TokenKind::CHECK
-            | TokenKind::COALESCE
+            // | TokenKind::COALESCE
             // | TokenKind::COLLATE
             // | TokenKind::COLUMN
             // | TokenKind::CONSTRAINT
@@ -836,7 +836,7 @@ impl TokenKind {
             // | TokenKind::FOREIGN
             // | TokenKind::GREATEST
             // | TokenKind::GROUPING
-            | TokenKind::IFNULL
+            // | TokenKind::IFNULL
             | TokenKind::IN
             // | TokenKind::INITIALLY
             // | TokenKind::INOUT
@@ -854,7 +854,7 @@ impl TokenKind {
             // | TokenKind::NORMALIZE
             | TokenKind::NOT
             | TokenKind::NULL
-            | TokenKind::NULLIF
+            // | TokenKind::NULLIF
             // | TokenKind::NUMERIC
             // | TokenKind::ONLY
             | TokenKind::OR

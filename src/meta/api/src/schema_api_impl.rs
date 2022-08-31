@@ -61,12 +61,16 @@ use common_meta_app::schema::UpdateTableMetaReply;
 use common_meta_app::schema::UpdateTableMetaReq;
 use common_meta_app::schema::UpsertTableOptionReply;
 use common_meta_app::schema::UpsertTableOptionReq;
+use common_meta_app::share::ShareGrantObjectPrivilege;
+use common_meta_app::share::ShareId;
+use common_meta_app::share::ShareNameIdent;
 use common_meta_types::app_error::AppError;
 use common_meta_types::app_error::CreateDatabaseWithDropTime;
 use common_meta_types::app_error::CreateTableWithDropTime;
 use common_meta_types::app_error::DatabaseAlreadyExists;
 use common_meta_types::app_error::DropDbWithDropTime;
 use common_meta_types::app_error::DropTableWithDropTime;
+use common_meta_types::app_error::ShareHasNoGrantedPrivilege;
 use common_meta_types::app_error::TableAlreadyExists;
 use common_meta_types::app_error::TableVersionMismatched;
 use common_meta_types::app_error::TxnRetryMaxTimes;
@@ -75,14 +79,18 @@ use common_meta_types::app_error::UndropDbWithNoDropTime;
 use common_meta_types::app_error::UndropTableAlreadyExists;
 use common_meta_types::app_error::UndropTableHasNoHistory;
 use common_meta_types::app_error::UndropTableWithNoDropTime;
+use common_meta_types::app_error::UnknownShareAccounts;
 use common_meta_types::app_error::UnknownTable;
 use common_meta_types::app_error::UnknownTableId;
+use common_meta_types::app_error::WrongShare;
 use common_meta_types::ConditionResult;
 use common_meta_types::GCDroppedDataReply;
 use common_meta_types::GCDroppedDataReq;
 use common_meta_types::MatchSeqExt;
 use common_meta_types::MetaError;
 use common_meta_types::MetaId;
+use common_meta_types::TxnCondition;
+use common_meta_types::TxnOp;
 use common_meta_types::TxnRequest;
 use common_tracing::func_name;
 use tracing::debug;
@@ -92,8 +100,11 @@ use ConditionResult::Eq;
 use crate::db_has_to_exist;
 use crate::deserialize_struct;
 use crate::fetch_id;
+use crate::get_share_database_id_and_privilege;
+use crate::get_share_or_err;
 use crate::get_struct_value;
 use crate::get_u64_value;
+use crate::is_db_need_to_be_remove;
 use crate::list_keys;
 use crate::list_u64_value;
 use crate::meta_encode_err;
@@ -130,6 +141,16 @@ impl<KV: KVApi> SchemaApi for KV {
                 CreateDatabaseWithDropTime::new(&name_key.db_name),
             )));
         }
+
+        // if create a database from a share, check if the share exists and grant access, update share_meta.
+        if let Some(from_share) = &req.meta.from_share {
+            if from_share.tenant == req.name_ident.tenant {
+                return Err(MetaError::AppError(AppError::WrongShare(WrongShare::new(
+                    req.name_ident.to_string(),
+                ))));
+            }
+        }
+
         let mut retry = 0;
         while retry < TXN_MAX_RETRY_TIMES {
             retry += 1;
@@ -173,6 +194,9 @@ impl<KV: KVApi> SchemaApi for KV {
             // append db_id into _fd_db_id_list/<tenant>/<db_name>
             // (db_id) -> (tenant,db_name)
 
+            // if create database from a share then also need to update these record:
+            // share_id -> share_meta
+
             let db_id = fetch_id(self, IdGenerator::database_id()).await?;
             let id_key = DatabaseId { db_id };
             let id_to_name_key = DatabaseIdToName { db_id };
@@ -183,18 +207,85 @@ impl<KV: KVApi> SchemaApi for KV {
                 // append db_id into db_id_list
                 db_id_list.append(db_id);
 
+                let mut condition = vec![
+                    txn_cond_seq(name_key, Eq, 0),
+                    txn_cond_seq(&id_to_name_key, Eq, 0),
+                    txn_cond_seq(&dbid_idlist, Eq, db_id_list_seq),
+                ];
+                let mut if_then = vec![
+                    txn_op_put(name_key, serialize_u64(db_id)?), // (tenant, db_name) -> db_id
+                    txn_op_put(&id_key, serialize_struct(&req.meta)?), // (db_id) -> db_meta
+                    txn_op_put(&dbid_idlist, serialize_struct(&db_id_list)?), /* _fd_db_id_list/<tenant>/<db_name> -> db_id_list */
+                    txn_op_put(&id_to_name_key, serialize_struct(name_key)?), /* __fd_database_id_to_name/<db_id> -> (tenant,db_name) */
+                ];
+
+                // if create a database from a share, check if the share exists and grant access, update share_meta.
+                if let Some(from_share) = &req.meta.from_share {
+                    // get share by share_name
+                    let (share_id_seq, share_id, share_meta_seq, mut share_meta) =
+                        get_share_or_err(
+                            self,
+                            from_share,
+                            format!("create_database from share: {}", from_share),
+                        )
+                        .await?;
+
+                    // check if the share has granted the account
+                    if !share_meta.has_account(&req.name_ident.tenant) {
+                        return Err(MetaError::AppError(AppError::UnknownShareAccounts(
+                            UnknownShareAccounts::new(
+                                &[req.name_ident.tenant.clone()],
+                                share_id,
+                                format!(
+                                    "share {} has not granted priviledge to {}",
+                                    from_share, req.name_ident.tenant
+                                ),
+                            ),
+                        )));
+                    }
+
+                    // check if the the share has granted a database
+                    let (share_from_db_id, privileges) =
+                        get_share_database_id_and_privilege(from_share, &share_meta)?;
+                    if !privileges.contains(ShareGrantObjectPrivilege::Usage) {
+                        return Err(MetaError::AppError(AppError::ShareHasNoGrantedPrivilege(
+                            ShareHasNoGrantedPrivilege::new(
+                                &from_share.tenant,
+                                &from_share.share_name,
+                            ),
+                        )));
+                    }
+
+                    // check if the share database existed
+                    let db_id_key = DatabaseId {
+                        db_id: share_from_db_id,
+                    };
+                    let (db_seq, db_meta): (u64, Option<DatabaseMeta>) =
+                        get_struct_value(self, &db_id_key).await?;
+                    if db_seq == 0 || db_meta.is_none() {
+                        return Err(MetaError::AppError(AppError::ShareHasNoGrantedPrivilege(
+                            ShareHasNoGrantedPrivilege::new(
+                                &from_share.tenant,
+                                &from_share.share_name,
+                            ),
+                        )));
+                    }
+
+                    // add share from database id
+                    share_meta.add_share_from_db_id(db_id);
+
+                    // All the checks have been done, add conditions and if_then
+                    let share_id_key = ShareId { share_id };
+                    condition.push(txn_cond_seq(from_share, Eq, share_id_seq)); // __fd_share/<tenant>/<share_name> -> <share_id>
+                    condition.push(txn_cond_seq(&share_id_key, Eq, share_meta_seq)); // __fd_share_id/<share_id> -> <share_meta>
+                    condition.push(txn_cond_seq(&db_id_key, Eq, db_seq)); // db_id -> <db_meta>
+
+                    if_then.push(txn_op_put(&share_id_key, serialize_struct(&share_meta)?)); /* (share_id) -> share_meta */
+                }
+
                 let txn_req = TxnRequest {
-                    condition: vec![
-                        txn_cond_seq(name_key, Eq, 0),
-                        txn_cond_seq(&id_to_name_key, Eq, 0),
-                        txn_cond_seq(&dbid_idlist, Eq, db_id_list_seq),
-                    ],
-                    if_then: vec![
-                        txn_op_put(name_key, serialize_u64(db_id)?), // (tenant, db_name) -> db_id
-                        txn_op_put(&id_key, serialize_struct(&req.meta)?), // (db_id) -> db_meta
-                        txn_op_put(&dbid_idlist, serialize_struct(&db_id_list)?), /* _fd_db_id_list/<tenant>/<db_name> -> db_id_list */
-                        txn_op_put(&id_to_name_key, serialize_struct(name_key)?), /* __fd_database_id_to_name/<db_id> -> (tenant,db_name) */
-                    ],
+                    condition,
+                    if_then,
                     else_then: vec![],
                 };
 
@@ -247,48 +338,101 @@ impl<KV: KVApi> SchemaApi for KV {
                 }
             };
 
-            // Delete db by these operations:
-            // del (tenant, db_name) -> db_id
-            // set db_meta.drop_on = now and update (db_id) -> db_meta
+            let mut condition = vec![];
+            let mut if_then = vec![];
 
-            let db_id_key = DatabaseId { db_id };
+            // remove db_name -> db id
+            condition.push(txn_cond_seq(tenant_dbname, Eq, db_id_seq));
+            if_then.push(txn_op_del(tenant_dbname)); // (tenant, db_name) -> db_id
 
-            debug!(db_id, name_key = debug(&tenant_dbname), "drop_database");
+            let (removed, from_share) = is_db_need_to_be_remove(
+                self,
+                db_id,
+                // remove db directly if created from share
+                |db_meta| db_meta.from_share.is_some(),
+                &mut condition,
+                &mut if_then,
+            )
+            .await?;
 
-            {
-                // drop a table with drop time
-                if db_meta.drop_on.is_some() {
-                    return Err(MetaError::AppError(AppError::DropDbWithDropTime(
-                        DropDbWithDropTime::new(&tenant_dbname.db_name),
-                    )));
-                }
-                // update drop on time
-                db_meta.drop_on = Some(Utc::now());
-
-                let txn_req = TxnRequest {
-                    condition: vec![
-                        txn_cond_seq(tenant_dbname, Eq, db_id_seq),
-                        txn_cond_seq(&db_id_key, Eq, db_meta_seq),
-                    ],
-                    if_then: vec![
-                        txn_op_del(tenant_dbname), // (tenant, db_name) -> db_id
-                        txn_op_put(&db_id_key, serialize_struct(&db_meta)?), // (db_id) -> db_meta
-                    ],
-                    else_then: vec![],
-                };
-
-                let (succ, _responses) = send_txn(self, txn_req).await?;
-
+            if removed {
+                // if db create from share then remove it directly and remove db id from share
                 debug!(
                     name = debug(&tenant_dbname),
-                    id = debug(&db_id_key),
-                    succ = display(succ),
-                    "drop_database"
+                    id = debug(&DatabaseId { db_id }),
+                    "drop_database from share"
                 );
 
-                if succ {
-                    return Ok(DropDatabaseReply {});
+                // if remove db, MUST also removed db id from db id list
+                let dbid_idlist = DbIdListKey {
+                    tenant: tenant_dbname.tenant.clone(),
+                    db_name: tenant_dbname.db_name.clone(),
+                };
+                let (db_id_list_seq, db_id_list_opt): (_, Option<DbIdList>) =
+                    get_struct_value(self, &dbid_idlist).await?;
+
+                let mut db_id_list = if db_id_list_seq == 0 {
+                    DbIdList::new()
+                } else {
+                    match db_id_list_opt {
+                        Some(list) => list,
+                        None => DbIdList::new(),
+                    }
+                };
+                if let Some(last_db_id) = db_id_list.last() {
+                    if *last_db_id == db_id {
+                        db_id_list.pop();
+                        condition.push(txn_cond_seq(&dbid_idlist, Eq, db_id_list_seq));
+                        if_then.push(txn_op_put(&dbid_idlist, serialize_struct(&db_id_list)?));
+                    }
                 }
+
+                if let Some(from_share) = from_share {
+                    remove_db_id_from_share(self, db_id, from_share, &mut condition, &mut if_then)
+                        .await?;
+                }
+            } else {
+                // Delete db by these operations:
+                // del (tenant, db_name) -> db_id
+                // set db_meta.drop_on = now and update (db_id) -> db_meta
+
+                let db_id_key = DatabaseId { db_id };
+
+                debug!(db_id, name_key = debug(&tenant_dbname), "drop_database");
+
+                {
+                    // drop a table with drop time
+                    if db_meta.drop_on.is_some() {
+                        return Err(MetaError::AppError(AppError::DropDbWithDropTime(
+                            DropDbWithDropTime::new(&tenant_dbname.db_name),
+                        )));
+                    }
+                    // update drop on time
+                    db_meta.drop_on = Some(Utc::now());
+
+                    condition.push(txn_cond_seq(&db_id_key, Eq, db_meta_seq));
+
+                    if_then.push(txn_op_put(&db_id_key, serialize_struct(&db_meta)?)); // (db_id) -> db_meta
+                }
+            }
+
+            let txn_req = TxnRequest {
+                condition,
+                if_then,
+                else_then: vec![],
+            };
+
+            let (succ, _responses) = send_txn(self, txn_req).await?;
+
+            debug!(
+                name = debug(&tenant_dbname),
+                id = debug(&DatabaseId { db_id }),
+                succ = display(succ),
+                "drop_database"
+            );
+
+            if succ {
+                return Ok(DropDatabaseReply {});
             }
         }
 
@@ -1914,8 +2058,35 @@ async fn gc_dropped_table(
     Ok(cnt)
 }
 
+async fn remove_db_id_from_share(
+    kv_api: &(impl KVApi + ?Sized),
+    db_id: u64,
+    from_share: ShareNameIdent,
+    condition: &mut Vec<TxnCondition>,
+    if_then: &mut Vec<TxnOp>,
+) -> Result<(), MetaError> {
+    // get share by share_name
+    let (share_id_seq, share_id, share_meta_seq, mut share_meta) = get_share_or_err(
+        kv_api,
+        &from_share,
+        format!("create_database from share: {}", from_share),
+    )
+    .await?;
+
+    share_meta.remove_share_from_db_id(db_id);
+
+    let share_id_key = ShareId { share_id };
+    condition.push(txn_cond_seq(&from_share, Eq, share_id_seq)); // __fd_share/<tenant>/<share_name> -> <share_id>
+    condition.push(txn_cond_seq(&share_id_key, Eq, share_meta_seq)); // __fd_share_id/<share_id> -> <share_meta>                
+
+    if_then.push(txn_op_put(&share_id_key, serialize_struct(&share_meta)?)); /* (share_id) -> share_meta */
+
+    Ok(())
+}
+
 async fn gc_dropped_db(
-    kv_api: &impl KVApi,
+    // kv_api: &impl KVApi,
+    kv_api: &(impl KVApi + ?Sized),
     tenant: String,
     at_least: u32,
 ) -> Result<u32, MetaError> {
@@ -1951,62 +2122,48 @@ async fn gc_dropped_db(
         };
 
         let mut new_db_id_list = DbIdList::new();
-        let mut removed_id_keys = vec![];
-        let mut removed_id_mappings = vec![];
 
-        for db_id in db_id_list.id_list.iter() {
-            let dbid = DatabaseId { db_id: *db_id };
+        let mut condition = vec![];
+        let mut if_then = vec![];
 
-            let (db_meta_seq, db_meta): (_, Option<DatabaseMeta>) =
-                get_struct_value(kv_api, &dbid).await?;
-            if db_meta_seq == 0 || db_meta.is_none() {
-                error!("get_database_history cannot find {:?} db_meta", db_id);
+        for db_id in db_id_list.id_list {
+            let (removed, from_share) = is_db_need_to_be_remove(
+                kv_api,
+                db_id,
+                // drop db if out of retention time
+                |db_meta| is_drop_time_out_of_retention_time(&db_meta.drop_on, &utc),
+                &mut condition,
+                &mut if_then,
+            )
+            .await?;
+
+            if removed {
+                cnt += 1;
+                if let Some(from_share) = from_share {
+                    remove_db_id_from_share(
+                        kv_api,
+                        db_id,
+                        from_share,
+                        &mut condition,
+                        &mut if_then,
+                    )
+                    .await?;
+                }
                 continue;
             }
 
-            let id_to_name = DatabaseIdToName { db_id: *db_id };
-            let (name_ident_seq, name_ident): (_, Option<DatabaseNameIdent>) =
-                get_struct_value(kv_api, &id_to_name).await?;
-            if name_ident_seq == 0 || name_ident.is_none() {
-                error!("cannot find {:?} db_name_ident", db_id);
-                continue;
-            }
-
-            let db_meta = db_meta.unwrap();
-            if is_drop_time_out_of_retention_time(&db_meta.drop_on, &utc) {
-                removed_id_keys.push((dbid, db_meta_seq));
-                removed_id_mappings.push((id_to_name, name_ident_seq));
-                continue;
-            }
-            new_db_id_list.append(*db_id);
+            new_db_id_list.append(db_id);
         }
 
-        if removed_id_keys.is_empty() {
+        if if_then.is_empty() {
             continue;
         }
 
         // construct the txn request
-        let mut condition = vec![
-            // condition: db id list not changed,
-            txn_cond_seq(&dbid_idlist, Eq, db_id_list_seq),
-        ];
-        for key in removed_id_keys.iter() {
-            // condition: db meta not changed,
-            condition.push(txn_cond_seq(&key.0, Eq, key.1));
-        }
-        let mut if_then = vec![
-            // save new db id list
-            txn_op_put(&dbid_idlist, serialize_struct(&new_db_id_list)?),
-        ];
-        for key in removed_id_keys.iter() {
-            // remove out of retention time table meta
-            if_then.push(txn_op_del(&key.0));
-        }
+        condition.push(txn_cond_seq(&dbid_idlist, Eq, db_id_list_seq));
 
-        for (key, ident_seq) in removed_id_mappings.iter() {
-            condition.push(txn_cond_seq(key, Eq, *ident_seq));
-            if_then.push(txn_op_del(key));
-        }
+        // save new db id list
+        if_then.push(txn_op_put(&dbid_idlist, serialize_struct(&new_db_id_list)?));
 
         let txn_req = TxnRequest {
             condition,
@@ -2015,7 +2172,6 @@ async fn gc_dropped_db(
         };
 
         let (_succ, _responses) = send_txn(kv_api, txn_req).await?;
-        cnt += removed_id_keys.len() as u32;
         if cnt >= at_least {
             break;
         }
