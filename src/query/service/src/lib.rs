@@ -38,6 +38,7 @@ pub mod pipelines;
 pub mod procedures;
 pub mod servers;
 pub mod sessions;
+pub mod spl;
 pub mod sql;
 pub mod storages;
 pub mod table_functions;

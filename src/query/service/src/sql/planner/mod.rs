@@ -28,9 +28,9 @@ pub use crate::sql::planner::binder::BindContext;
 
 pub(crate) mod binder;
 mod format;
-mod metadata;
+pub(crate) mod metadata;
 pub mod plans;
-mod semantic;
+pub(crate) mod semantic;
 
 pub use binder::Binder;
 pub use binder::ColumnBinding;
@@ -49,7 +49,7 @@ use super::optimizer::OptimizerContext;
 use crate::sessions::TableContext;
 
 pub struct Planner {
-    ctx: Arc<QueryContext>,
+    pub(crate) ctx: Arc<QueryContext>,
 }
 
 impl Planner {

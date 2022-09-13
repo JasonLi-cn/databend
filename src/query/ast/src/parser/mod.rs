@@ -14,6 +14,7 @@
 
 pub mod expr;
 pub mod query;
+pub mod spl_statement;
 pub mod statement;
 pub mod token;
 pub mod unescape;

@@ -925,7 +925,7 @@ pub fn binary_op(i: Input) -> IResult<BinaryOperator> {
             value(BinaryOperator::NotRegexp, rule! { NOT ~ REGEXP }),
             value(BinaryOperator::RLike, rule! { RLIKE }),
             value(BinaryOperator::NotRLike, rule! { NOT ~ RLIKE }),
-            value(BinaryOperator::BitwiseOr, rule! { "|" }),
+            // value(BinaryOperator::BitwiseOr, rule! { "|" }), // test spl @ jasonli
             value(BinaryOperator::BitwiseAnd, rule! { "&" }),
             value(BinaryOperator::BitwiseXor, rule! { "^" }),
         )),

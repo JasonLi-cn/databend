@@ -733,6 +733,12 @@ pub enum TokenKind {
     FIRST,
     #[token("LAST", ignore(ascii_case))]
     LAST,
+
+    // spl @jasonli
+    #[token("SEARCH", ignore(ascii_case))]
+    SEARCH,
+    #[token("SOURCE", ignore(ascii_case))]
+    SOURCE,
 }
 
 // Reference: https://www.postgresql.org/docs/current/sql-keywords-appendix.html
